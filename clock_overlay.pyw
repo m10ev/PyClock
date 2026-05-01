@@ -291,7 +291,7 @@ class ClockOverlay:
 
     def _check_for_updates(self):
         """Checks GitHub for a new release and asks to redirect."""
-        current_version = "v1.1.0"
+        current_version = "PyClock v1.1.0"
         repo = "m10ev/PyClock"
 
         try:
