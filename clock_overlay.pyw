@@ -1,7 +1,10 @@
 import tkinter as tk
-from tkinter import font as tkfont
 import requests
-from plyer import notification
+import pystray
+from PIL import Image, ImageDraw
+import webbrowser
+from tkinter import messagebox
+import threading
 import math
 import time
 import json
@@ -34,7 +37,6 @@ THEMES = {
     }
 }
 
-
 class ClockOverlay:
     def __init__(self, root):
         self.root = root
@@ -42,12 +44,15 @@ class ClockOverlay:
         self.root.overrideredirect(True)
         self.root.wm_attributes("-topmost", True)
 
+        self._after_id = None
+
         # State Variables
         self.theme_name = tk.StringVar(value="dark")
         self.use_24h = tk.BooleanVar(value=False)
         self.show_date = tk.BooleanVar(value=True)
         self.scale = tk.DoubleVar(value=1.0)
         self.is_fullscreen = False
+        self.start_on_boot = tk.BooleanVar(value=False)
 
         self._drag_x = 0
         self._drag_y = 0
@@ -55,6 +60,7 @@ class ClockOverlay:
         self._load_settings()
         self._build_ui()
         self._apply_theme()
+        self._setup_tray()
 
         # Initial Position
         sw = self.root.winfo_screenwidth()
@@ -63,6 +69,7 @@ class ClockOverlay:
         self._tick()
 
         self._check_for_updates()
+
 
     def _build_ui(self):
         self.container = tk.Frame(self.root)
@@ -96,18 +103,26 @@ class ClockOverlay:
         self.menu.add_command(label="Scale +", command=lambda: self._change_scale(0.1))
         self.menu.add_command(label="Scale -", command=lambda: self._change_scale(-0.1))
         self.menu.add_separator()
-        self.menu.add_command(label="Exit", command=self.root.destroy)
+        self.menu.add_checkbutton(
+            label="Run on Startup",
+            variable=self.start_on_boot,
+            command=self._toggle_startup
+        )
+        self.menu.add_separator()
+        self.menu.add_command(label="Exit", command=self._graceful_exit)
+
+        self.root.protocol("WM_DELETE_WINDOW", self._graceful_exit)
 
         self.root.bind("<F11>", lambda e: self._toggle_fullscreen())
         self.root.bind("<Escape>", lambda e: self._exit_fullscreen())
 
     def _save_settings(self):
-        """Saves current state to a JSON file."""
         data = {
             "theme": self.theme_name.get(),
             "scale": self.scale.get(),
             "use_24h": self.use_24h.get(),
-            "show_date": self.show_date.get()
+            "show_date": self.show_date.get(),
+            "start_on_boot": self.start_on_boot.get()
         }
         with open(SAVE_FILE, "w") as f:
             json.dump(data, f)
@@ -122,6 +137,7 @@ class ClockOverlay:
                     self.scale.set(data.get("scale", 1.0))
                     self.use_24h.set(data.get("use_24h", False))
                     self.show_date.set(data.get("show_date", True))
+                    self.start_on_boot.set(data.get("start_on_boot", False))
             except:
                 pass
 
@@ -144,21 +160,27 @@ class ClockOverlay:
     def _toggle_fullscreen(self):
         self.is_fullscreen = not self.is_fullscreen
 
-        # Withdraw the window briefly to reset its state with the OS
+        # Withdraw to prevent visual flickering during the transition
         self.root.withdraw()
 
-        if self.is_fullscreen:
-            # Disable override so the OS recognizes the fullscreen request
-            self.root.overrideredirect(False)
-            self.root.attributes("-fullscreen", True)
-        else:
-            self.root.attributes("-fullscreen", False)
-            # Re-enable override for the floating overlay look
-            self.root.overrideredirect(True)
+        try:
+            if self.is_fullscreen:
+                # We force a small update to ensure the window exists in the OS eye
+                self.root.update_idletasks()
+                self.root.overrideredirect(False)
+                self.root.attributes("-fullscreen", True)
+            else:
+                self.root.attributes("-fullscreen", False)
+                self.root.update_idletasks()
+                self.root.overrideredirect(True)
+        except tk.TclError:
+            # If the error occurs, we ignore it because the state
+            # usually changes correctly regardless of the return value
+            pass
 
-        # Bring the window back and update colors
-        self.root.deiconify()
-        self._apply_theme()
+        # Use 'after' to ensure the OS has processed the state change
+        # before bringing the window back
+        self.root.after(100, lambda: (self.root.deiconify(), self._apply_theme()))
 
     def _exit_fullscreen(self):
         if self.is_fullscreen:
@@ -185,6 +207,7 @@ class ClockOverlay:
         self._save_settings()
 
     def _draw_face(self):
+        self.canvas.delete("all")
         t = THEMES[self.theme_name.get()]
         cx, cy, r = self.center, self.center, self.radius
         self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r, fill=t["face"], outline=t["ticks"], width=2)
@@ -201,6 +224,33 @@ class ClockOverlay:
         self.hour_hand = self.canvas.create_line(0, 0, 0, 0, width=4, fill=t["hand"], capstyle="round")
         self.min_hand = self.canvas.create_line(0, 0, 0, 0, width=3, fill=t["hand"], capstyle="round")
         self.sec_hand = self.canvas.create_line(0, 0, 0, 0, width=1, fill=t["second"])
+
+    def _setup_tray(self):
+        """Creates a system tray icon with a toolbox-style look."""
+        # Create a simple icon image (or load an .ico file)
+        width, height = 64, 64
+        image = Image.new('RGB', (width, height), (30, 30, 46))  # Dark background
+        dc = ImageDraw.Draw(image)
+        # Draw a simple toolbox/wrench shape
+        dc.rectangle([10, 20, 54, 50], fill="#cdd6f4")
+        dc.rectangle([25, 10, 39, 20], outline="#cdd6f4", width=4)
+
+        # Inside _setup_tray
+        menu = pystray.Menu(
+            pystray.MenuItem("Show/Hide", self._toggle_visibility),
+            pystray.MenuItem("Exit", lambda icon, item: self._graceful_exit())
+        )
+
+        self.tray = pystray.Icon("ClockOverlay", image, "Clock Overlay", menu)
+        # Run tray in a separate thread so it doesn't freeze the clock
+        threading.Thread(target=self.tray.run, daemon=True).start()
+
+    def _toggle_visibility(self):
+        """Standard tray functionality to show/hide the clock."""
+        if self.root.winfo_viewable():
+            self.root.withdraw()
+        else:
+            self.root.deiconify()
 
     def _tick(self):
         now = time.localtime()
@@ -226,7 +276,7 @@ class ClockOverlay:
         else:
             self.date_lbl.pack_forget()
 
-        self.root.after(100, self._tick)
+        self._after_id = self.root.after(100, self._tick)
 
     def _show_menu(self, e):
         self.menu.tk_popup(e.x_root, e.y_root)
@@ -240,21 +290,89 @@ class ClockOverlay:
             self.root.geometry(f"+{e.x_root - self._drag_x}+{e.y_root - self._drag_y}")
 
     def _check_for_updates(self):
-        current_version = "v1.0.0"
-        repo = "m10ev/your-repo-name"
+        """Checks GitHub for a new release and asks to redirect."""
+        current_version = "v1.1.0"
+        repo = "m10ev/PyClock"
+
         try:
-            response = requests.get(f"https://api.github.com/repos/{repo}/releases/latest", timeout=5)
-            latest_version = response.json()["name"]
+            # Use a short timeout so the app doesn't freeze if the internet is slow
+            response = requests.get(
+                f"https://api.github.com/repos/{repo}/releases/latest",
+                timeout=5
+            )
+            if response.status_code == 200:
+                data = response.json()
+                latest_version = data.get("name", "")
+                download_url = data.get("html_url", "")
 
-            if latest_version != current_version:
-                notification.notify(
-                    title="Update Available",
-                    message=f"A new version ({latest_version}) is available on GitHub!",
-                    app_name="Clock Overlay"
-                )
+                if latest_version and latest_version != current_version:
+                    # This pops a real window that won't be missed
+                    if messagebox.askyesno(
+                            "Update Available",
+                            f"A new version ({latest_version}) is available!\n\n"
+                            "Would you like to open the download page?"
+                    ):
+                        webbrowser.open(download_url)
         except Exception:
-            pass  # Fail silently if no internet
+            pass
 
+    def _toggle_startup(self):
+        import winreg as reg
+        import sys
+
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        app_name = "ClockOverlay"
+
+        # If running as an EXE, sys.executable is the path to your EXE.
+        # If running as a script, it's the path to python.exe.
+        exe_path = os.path.realpath(sys.executable)
+
+        try:
+            key = reg.OpenKey(reg.HKEY_CURRENT_USER, key_path, 0, reg.KEY_ALL_ACCESS)
+            if self.start_on_boot.get():
+                # Add to registry
+                reg.SetValueEx(key, app_name, 0, reg.REG_SZ, f'"{exe_path}"')
+            else:
+                # Remove from registry
+                try:
+                    reg.DeleteValue(key, app_name)
+                except FileNotFoundError:
+                    pass
+            reg.CloseKey(key)
+        except Exception as e:
+            print(f"Registry error: {e}")
+
+        self._save_settings()
+
+    def _graceful_exit(self):
+        self.is_running = False
+
+        # 1. Stop the tray icon immediately so it vanishes from the taskbar
+        if hasattr(self, 'tray'):
+            try:
+                self.tray.stop()
+            except:
+                pass
+
+        # 2. Stop the clock loop so it doesn't try to draw on a dead canvas
+        if self._after_id:
+            try:
+                self.root.after_cancel(self._after_id)
+            except:
+                pass
+
+        # 3. DESTROY THE WHITE BOX: Force Windows to refresh the screen area
+        try:
+            self.root.overrideredirect(False)  # Tell Windows it's a 'real' window again
+            self.root.withdraw()  # Hide it immediately
+            self.root.update_idletasks()  # Flush the UI queue
+        except:
+            pass
+
+        # 4. Final Process Kill
+        self.root.quit()
+        # A tiny delay ensures the tray.stop() and withdraw() finish before destruction
+        self.root.after(100, self.root.destroy)
 
 if __name__ == "__main__":
     root = tk.Tk()
