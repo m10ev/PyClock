@@ -62,6 +62,8 @@ class ClockOverlay:
 
         self._tick()
 
+        self._check_for_updates()
+
     def _build_ui(self):
         self.container = tk.Frame(self.root)
         self.container.pack(expand=True)
